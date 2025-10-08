@@ -1,138 +1,161 @@
-# Tech Challenge 3 — Fine-tuning do Llama 3.2 1B Instruct com LoRA (Unsloth)
+# Tech Challenge 3 — Fine-tuning com Unsloth (pt-BR)
 
-Este repositório contém um notebook para realizar fine-tuning leve (LoRA) do modelo `unsloth/Llama-3.2-1B-Instruct` usando as bibliotecas Unsloth, TRL e PEFT. O objetivo é treinar o modelo para gerar descrições de produtos a partir de seus títulos, com base nos dados em `data/trn.json`.
+Este repositório contém um notebook (tc3_fine_tuning.ipynb) que realiza fine-tuning leve (LoRA) de um modelo de linguagem a partir de uma lista de produtos. O objetivo é treinar o modelo para responder/gerar descrições coerentes dos produtos usando títulos e conteúdos fornecidos em um arquivo JSONL.
 
-## Visão geral
-- Modelo base: `unsloth/Llama-3.2-1B-Instruct`
-- Formato de dados: JSON Lines (um JSON por linha) em `data/trn.json`
-- Mapeamento (instrução -> entrada -> saída):
-  - instrução: `"DESCRIBE ABOUT THE PRODUCT."`
-  - input: campo `title`
-  - output: campo `content`
-- Técnica: LoRA aplicada a um modelo quantizado em 4 bits (via Unsloth + PEFT)
-- Arquivo principal: `fine_tune_llama3.ipynb`
-- Saídas de treino: `outputs/llama-3.2-1b-lora`
+Resumo do fluxo (conforme o notebook):
+- Ambiente alvo: Google Colab (com GPU, idealmente L4/A100), usando Google Drive para ler/gravar arquivos.
+- Dados de entrada: JSON Lines (um JSON por linha) com campos `title` e `content`.
+- Modelo base (pré-treinado): `unsloth/llama-3-8b-bnb-4bit` (carregado em 4 bits).
+- Técnica: LoRA via Unsloth/PEFT aplicada em módulos projetores da atenção/MLP.
+- Treinador: TRL SFTTrainer (instrução supervisionada) com formatação de prompts.
+- Saída: dataset formatado `trn_output.json` e adaptadores/weights LoRA salvos ao final.
 
-O notebook prepara os dados, aplica o template de chat do modelo, treina com LoRA e mostra como carregar os adaptadores para geração (inferência).
-
-## Dados (data/trn.json)
-- Espera-se um arquivo no formato JSONL, onde cada linha é um objeto com os campos:
+## Dados de treino (trn.json)
+- Formato esperado (JSONL): cada linha contém um objeto com os campos:
   - `title`: título do produto (string)
   - `content`: descrição do produto (string)
-- O notebook descarta linhas sem `content` (para garantir que a saída/target seja não vazia).
-- A instrução usada durante o treino é fixa: `DESCRIBE ABOUT THE PRODUCT.`
+- Linhas com `title` vazio ou `content` vazio são descartadas.
+- O notebook lê e grava, por padrão, nestes caminhos (Colab + Drive):
+  - `DATA_PATH = "/content/drive/MyDrive/tc3/trn.json"`
+  - `OUTPUT_PATH_DATASET = "/content/drive/MyDrive/tc3/trn_output.json"`
 
-Exemplo de linha em `data/trn.json`:
+Exemplo de linha válida:
 ```json
 {"title": "Girls Ballet Tutu Neon Pink", "content": "Uma linda saia tutu rosa neon para ballet, leve e confortável..."}
 ```
 
-## Modelo e tokenizador
-O notebook carrega o modelo e tokenizador com Unsloth:
-- `model_id = 'unsloth/Llama-3.2-1B-Instruct'`
-- `max_seq_length = 2048`
-- `load_in_4bit = True` (quantização 4-bit para economia de memória)
-- `model.config.use_cache = False` durante o treino (importante para não conflitar com o gradiente)
+## Dependências e ambiente
+No Google Colab, o notebook instala as dependências assim:
+```bash
+pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+pip install --no-deps xformers==0.0.27 "trl<0.9.0" peft accelerate bitsandbytes
+pip install -q transformers datasets triton torch torchvision xformers
+```
+Observações:
+- É necessário montar o Google Drive para acessar os arquivos (célula `drive.mount('/content/drive')`).
+- Use GPU com suporte adequado (o notebook comenta L4). O script utiliza 4-bit (`load_in_4bit=True`).
 
-O template de chat do tokenizador é usado para montar exemplos do tipo:
-- Usuário: `DESCRIBE ABOUT THE PRODUCT.\nTitle: {title}`
-- Assistente: `{content}`
-
-## Configuração LoRA usada
-A configuração de LoRA aplicada no notebook (via `FastLanguageModel.get_peft_model`) é:
-- `r = 16`
-- `lora_alpha = 32`
-- `lora_dropout = 0.05`
-- `target_modules = ['q_proj','k_proj','v_proj','o_proj','gate_proj','up_proj','down_proj']`
-
-Os adaptadores LoRA são salvos em `outputs/llama-3.2-1b-lora` ao final do treino.
-
-## Hiperparâmetros de treinamento (TrainingArguments)
-No notebook, os principais argumentos de treino são definidos assim:
-- `per_device_train_batch_size = 16` => Quantidade de amostras processadas por GPU/CPU a cada passo de treino. Impacta diretamente o uso de memória. 
-- `gradient_accumulation_steps = 2` => Faz acumular gradientes por 2 passos antes de atualizar os pesos. Aumenta o “tamanho de lote efetivo” sem exigir mais memória de uma só vez.
-- `num_train_epochs = 3` => Quantas passagens completas sobre o conjunto de treino (épocas) serão feitas. Se max_steps também for definido, ele tem precedência e pode encerrar o treino antes de completar as épocas.
-- `learning_rate = 3e-5` => Taxa de aprendizado inicial (ou máxima, dependendo do scheduler). Para LoRA em LLMs, valores comuns: 1e-4 a 5e-5 a 1e-5. Muito alto → instabilidade/perda explode; muito baixo → treino lento/subótimo.
-- `logging_steps = 1` => Frequência (em passos) para registrar métricas (loss etc.).
-- `save_steps = 100` => Frequência (em passos) para salvar checkpoints.
-- `max_steps = 200` => limita o número total de passos; útil para testes rápidos
-- `warmup_steps = 10` => Passos iniciais com aumento gradual da learning_rate (de 0 até o valor base). Ajuda na estabilidade no começo do treino.
-- `fp16 = False` => Ativa precisão mista em 16 bits (float16). Reduz memória e pode acelerar, mas requer suporte de hardware.
-- `bf16 = True` => Ativa precisão mista em bfloat16. Geralmente mais estável que fp16 e bem suportada em GPUs Ampere+ (A100, RTX 30/40) e TPUs.
-- `optim = 'paged_adamw_8bit'` => Otimizador AdamW em 8 bits (via bitsandbytes) com paginação, reduzindo uso de memória.
-- `lr_scheduler_type = 'cosine'` => Agenda de taxa de aprendizado cosseno. Começa no pico (após warmup) e decai suavemente até próximo de 0.
-- `output_dir = 'outputs/llama-3.2-1b-lora'` => Pasta onde checkpoints, adaptadores LoRA e logs são salvos.
-- `seed = 42` => Semente de aleatoriedade para reprodutibilidade (tokenização, embaralhamento, inicializações etc.).
-
-Outros pontos importantes no pipeline do notebook:
-- Tokenização com `max_length = 1024` (para os exemplos de treino). As labels são iguais a `input_ids` (treino causal LM).
-- `packing = True` no `SFTTrainer` para aproveitar melhor o contexto juntando múltiplos exemplos.
-- Split treino/val automático (5% para teste quando há mais de 20 amostras).
-
-## Como executar o notebook
-1. Abra o arquivo `fine_tune_llama3.ipynb` em um ambiente com Jupyter/Colab/Vscode.
-2. Instale as dependências (há uma célula no início do notebook):
-   ```bash
-   %pip -q install --upgrade "unsloth>=2024.08.08" "transformers>=4.43.3" "datasets>=2.20.0" "accelerate>=0.33.0" "peft>=0.11.1" "trl>=0.9.4" "sentencepiece>=0.2.0" "huggingface_hub>=0.24.6" "triton>=2.3.1"
-   ```
-3. Garanta que `data/trn.json` exista e esteja no formato esperado.
-4. Execute as células na ordem. Ao final do treino, os adaptadores serão salvos em `outputs/llama-3.2-1b-lora`.
-
-Observação sobre token da Hugging Face:
-- O notebook usa um token Hugging Face para baixar o modelo. Recomenda-se substituir o valor hardcoded por uma variável de ambiente e ler com `os.getenv('HF_TOKEN')` ou inserir o token de forma segura no ambiente de execução.
-
-## Inferência com os adaptadores LoRA
-Após o treino, o notebook demonstra como carregar o modelo base e anexar os adaptadores LoRA:
-- Carrega-se novamente o `unsloth/Llama-3.2-1B-Instruct` (4-bit, `use_cache=True`),
-- Aplica-se `PeftModel.from_pretrained(base_model, 'outputs/llama-3.2-1b-lora')`.
-
-Exemplo de uso (simplificado):
+## Carregamento do modelo pré-treinado
+O notebook carrega o modelo/ tokenizer com Unsloth:
 ```python
 from unsloth import FastLanguageModel
-from peft import PeftModel
-import torch
-
-model_id = 'unsloth/Llama-3.2-1B-Instruct'
-base_model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=model_id,
-    max_seq_length=2048,
-    dtype=None,
-    load_in_4bit=True,
+max_seq_length = 2048
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "unsloth/llama-3-8b-bnb-4bit",
+    max_seq_length = max_seq_length,
+    dtype = None,
+    load_in_4bit = True,
+    device_map = "auto",
 )
-base_model.config.use_cache = True
-adapted = PeftModel.from_pretrained(base_model, 'outputs/llama-3.2-1b-lora')
-adapted.eval()
+```
+Antes e depois do treino, o notebook realiza testes de geração usando um prompt de instrução:
+```text
+Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
-def gerar_descricao(titulo: str, max_new_tokens: int = 128):
-    messages = [
-        { 'role': 'user', 'content': f'DESCRIBE ABOUT THE PRODUCT.\nTitle: {titulo}' }
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(prompt, return_tensors='pt').to(adapted.device)
-    with torch.no_grad():
-        out = adapted.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.7,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-    return tokenizer.decode(out[0], skip_special_tokens=True)
+### Instruction:
+{instruction}
 
-print(gerar_descricao('Girls Ballet Tutu Neon Pink'))
+### Input:
+{input}
+
+### Response:
+{}
 ```
 
-## Dicas de desempenho/memória
-- Se houver estouro de memória, reduza `max_length` da tokenização, aumente `gradient_accumulation_steps`, ou diminua `per_device_train_batch_size`.
-- Manter `load_in_4bit=True` ajuda bastante a treinar em GPUs menores.
-- Ajuste `max_steps`, `num_train_epochs` e `save_steps` conforme sua disponibilidade de tempo/recursos.
+## Preparação do dataset formatado
+O notebook inclui funções para ler `trn.json` (JSONL) e gerar `trn_output.json` com o seguinte mapeamento:
+- `instruction`: string fixa "Describe the product [input]"
+- `input_text`: recebe o `title`
+- `response`: concatena "The '{title}' is {content}"
 
-## Estrutura de diretórios relevante
-- `data/trn.json`: dados de treino em JSONL.
-- `fine_tune_llama3.ipynb`: notebook principal de fine-tuning.
-- `outputs/llama-3.2-1b-lora`: diretório onde os adaptadores LoRA e estados de treino são salvos.
-- `unsloth_compiled_cache`: cache compilado do Unsloth (pode ser recriado; geralmente não é necessário versionar).
+Trecho relevante:
+```python
+formatted_item = {
+    "instruction": "Describe the product [input]",
+    "input_text": title,
+    "response": f"The '{title}' is {content}"
+}
+```
+Depois, é aplicado um template de prompt por amostra para o SFT:
+```python
+product_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{}
+
+### Input:
+{}
+
+### Response:
+{}"""
+```
+
+## Configuração LoRA (via Unsloth)
+```python
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 16,
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"],
+    lora_alpha = 16,
+    lora_dropout = 0,
+    bias = "none",
+    use_gradient_checkpointing = "unsloth",
+    random_state = 3407,
+    use_rslora = False,
+    loftq_config = None,
+)
+```
+
+## Hiperparâmetros de treino (TrainingArguments)
+Definidos conforme o notebook:
+- `per_device_train_batch_size = 8`
+- `gradient_accumulation_steps = 4`
+- `warmup_ratio = 0.2`
+- `learning_rate = 3e-5`
+- `max_steps = 60`
+- `fp16 = not is_bfloat16_supported()`
+- `bf16 = is_bfloat16_supported()`
+- `logging_steps = 1`
+- `optim = "adamw_8bit"`
+- `weight_decay = 0.01`
+- `lr_scheduler_type = "linear"`
+- `seed = 3407`
+- `output_dir = "outputs"`
+- `num_train_epochs = 4`
+- `save_strategy = "steps"`
+- `save_steps = 10`
+
+O treino é executado via `SFTTrainer`. O notebook também registra perdas de treino/validação com um callback customizado e plota um gráfico (matplotlib) ao final.
+
+## Execução (passo a passo resumido)
+1. Abra `tc3_fine_tuning.ipynb` no Google Colab.
+2. Monte o Google Drive: `drive.mount('/content/drive')`.
+3. Instale as dependências (células indicadas no notebook).
+4. Garanta que `trn.json` esteja em `/content/drive/MyDrive/tc3/trn.json` no formato esperado.
+5. Execute as células na ordem: pré-teste de geração, formatação de dataset, configuração LoRA, treino, gráfico de perdas e pós-teste.
+6. Os arquivos gerados incluem `trn_output.json` e o modelo/adaptadores salvos.
+
+## Teste de inferência (pós-treino)
+O notebook demonstra novas gerações para títulos como `'On Happiness, U.S. Edition'` e `'The book of revelation'`, usando o mesmo prompt de instrução acima e `TextStreamer` para exibir a resposta.
+
+## Salvamento do modelo
+Ao final, os artefatos LoRA e tokenizer são salvos no Drive:
+```python
+model.save_pretrained("/content/drive/MyDrive/tc3/lora_model")
+tokenizer.save_pretrained("/content/drive/MyDrive/tc3/lora_model")
+```
+
+## Dicas e observações
+- Use uma GPU com VRAM suficiente e mantenha `load_in_4bit=True` para economia de memória.
+- Se ocorrer OOM, reduza `per_device_train_batch_size`, aumente `gradient_accumulation_steps` e/ou reduza `max_seq_length`.
+- Verifique caminhos do Drive (ajuste `/content/drive/MyDrive/tc3/` conforme sua pasta) e permissões.
+
+## Estrutura relevante do repositório
+- `tc3_fine_tuning.ipynb`: notebook principal deste projeto.
+- `data/trn.json`: exemplo/local alternativo de dados (se não usar Drive, adapte o caminho no notebook).
+- `outputs/`: diretório de saídas do treino (no ambiente de execução).
+- `unsloth_compiled_cache/`: cache interno do Unsloth.
 
 ## Licença
-Consulte o arquivo `LICENSE` deste repositório e as licenças dos modelos e bibliotecas utilizadas (Unsloth, Transformers, Datasets, TRL, PEFT, etc.).
+Consulte o arquivo `LICENSE` deste repositório e as licenças dos modelos e bibliotecas utilizadas (Unsloth, Transformers, Datasets, TRL, PEFT, Accelerate, BitsAndBytes, etc.).
